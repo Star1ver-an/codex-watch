@@ -18,3 +18,11 @@
 *.iml
 .DS_Store
 Thumbs.db
+
+# Local runtime audit logs
+**/*-audit.jsonl
+
+# Local watch/UI test captures
+/ui-*.xml
+/ui-*.png
+/watch-ui*.xml

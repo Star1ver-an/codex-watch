@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { StateStore, type RolloutEvent } from '../core/state-store.js';
+import { approvalWithMetadata } from '../core/approval-metadata.js';
 import type { ApprovalEntry } from '../types.js';
 import { sessionsDir } from '../config.js';
 
@@ -14,6 +15,9 @@ interface TrackedFile {
   path: string;
   offset: number;
   threadId?: string;
+  parentThreadId?: string;
+  agentLabel?: string;
+  isSubagent?: boolean;
   knownThreadIds: Set<string>;
 }
 
@@ -165,11 +169,19 @@ export class RolloutTail {
     const type = obj?.type as string | undefined;
     const payload = obj?.payload ?? {};
 
-    // Resolve thread id
+    // Resolve thread id. A spawned subagent writes its own rollout file, but its
+    // activity must be folded into the parent conversation on the watch.
     let threadId: string | undefined;
     if (type === 'session_meta') {
       threadId = payload.id || payload.session_id;
       if (threadId) tf.threadId = threadId;
+
+      const spawn = payload.source?.subagent?.thread_spawn;
+      if (payload.thread_source === 'subagent' && spawn?.parent_thread_id) {
+        tf.isSubagent = true;
+        tf.parentThreadId = String(spawn.parent_thread_id);
+        tf.agentLabel = String(spawn.agent_nickname || spawn.agent_role || 'Subagent');
+      }
     } else if (type === 'event_msg' || type === 'response_item') {
       threadId = payload.thread_id || tf.threadId;
     }
@@ -179,10 +191,27 @@ export class RolloutTail {
     }
     if (!threadId) return; // cannot attribute yet
 
-    const push = (ev: RolloutEvent) => this.store.applyRolloutEvent(threadId!, ev);
+    // Child rollout IDs are only used to identify the file. Status, approvals and
+    // timeline events belong to the parent conversation.
+    const targetThreadId = tf.isSubagent ? (tf.parentThreadId ?? threadId) : threadId;
+    const agent = tf.isSubagent ? tf.agentLabel : undefined;
+    const push = (ev: RolloutEvent) =>
+      this.store.applyRolloutEvent(targetThreadId!, {
+        ...ev,
+        agent,
+        isSubagent: tf.isSubagent,
+      });
 
     if (type === 'session_meta') {
-      push({ tsMs, kind: 'context', cwd: payload.cwd });
+      if (!tf.isSubagent) {
+        push({ tsMs, kind: 'context', cwd: payload.cwd });
+      } else {
+        push({
+          tsMs,
+          kind: 'item_completed',
+          detail: `subagent started: ${tf.agentLabel}`,
+        });
+      }
       return;
     }
     if (type === 'turn_context') {
@@ -195,7 +224,28 @@ export class RolloutTail {
       });
       return;
     }
-    if (type !== 'event_msg') return; // response_item/token_usage_record/world_state ignored for M1
+    // Capture assistant replies so a watch-dispatched instruction can be marked
+    // completed when Codex responds in the desktop conversation.
+    if (type === 'response_item' && payload?.type === 'message' && payload?.role === 'assistant') {
+      const content = Array.isArray(payload.content) ? payload.content : [];
+      const text = content
+        .map((part: any) => (part?.type === 'output_text' && typeof part.text === 'string' ? part.text : ''))
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      if (text) {
+        this.store.recordAgentMessage(
+          targetThreadId,
+          text,
+          tsMs,
+          threadId,
+          tf.isSubagent,
+        );
+      }
+      return;
+    }
+
+    if (type !== 'event_msg') return; // token_usage_record/world_state ignored for M1
 
     const pt = payload.type as string | undefined;
     if (!pt) return;
@@ -212,7 +262,11 @@ export class RolloutTail {
         return;
       case 'token_count': {
         const tokens = payload?.info?.total_token_usage?.total_tokens;
-        push({ tsMs, kind: 'token_count', tokens: typeof tokens === 'number' ? tokens : undefined });
+        if (!tf.isSubagent && typeof tokens === 'number') {
+          push({ tsMs, kind: 'token_count', tokens });
+        } else if (tf.isSubagent) {
+          push({ tsMs, kind: 'item_completed', detail: 'progress updated' });
+        }
         return;
       }
       case 'item_completed':
@@ -226,14 +280,14 @@ export class RolloutTail {
     // match by name so future event shapes are picked up).
     if (/approval/i.test(pt)) {
       if (/request/i.test(pt)) {
-        const approval: ApprovalEntry = {
-          id: payload.call_id || payload.id || `evt-${obj.ordinal ?? tsMs}`,
+        const approval = approvalWithMetadata({
+          id: String(payload.call_id || payload.id || `evt-${obj.ordinal ?? tsMs}`),
           title: approvalTitle(payload, pt),
           detail: JSON.stringify(payload).slice(0, 600),
           risk: guessRisk(payload),
           createdAtMs: tsMs,
-          source: 'rollout',
-        };
+          source: 'rollout' as const,
+        }, payload);
         push({ tsMs, kind: 'approval_request', approval });
         if (DEBUG) console.log(`[rollout-tail] approval request detected: ${JSON.stringify(approval).slice(0, 200)}`);
       } else {

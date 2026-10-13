@@ -18,7 +18,14 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            // Local test builds use the debug key so release performance can be verified on watch.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

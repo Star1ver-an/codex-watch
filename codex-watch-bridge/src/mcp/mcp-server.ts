@@ -19,10 +19,12 @@ const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'bridge.
 dlog('config loaded, port=' + cfg.port);
 
 interface PendingCall {
-  resolve: (decision: string) => void;
+  resolve: (value: any) => void;
 }
 
 const pending = new Map<string, PendingCall>();
+const instructionGets = new Map<string, PendingCall>();
+const instructionCompletes = new Map<string, PendingCall>();
 let ws: WebSocket | null = null;
 let connectPromise: Promise<void> | null = null;
 
@@ -58,6 +60,18 @@ function ensureConnected(): Promise<void> {
           pending.delete(msg.reqId);
           p.resolve(String(msg.decision));
         }
+      } else if (msg.type === 'watch_instruction_get_result') {
+        const p = instructionGets.get(msg.reqId);
+        if (p) {
+          instructionGets.delete(msg.reqId);
+          p.resolve(Array.isArray(msg.instructions) ? msg.instructions : []);
+        }
+      } else if (msg.type === 'watch_instruction_complete_result') {
+        const p = instructionCompletes.get(msg.reqId);
+        if (p) {
+          instructionCompletes.delete(msg.reqId);
+          p.resolve(msg);
+        }
       } else if (msg.type === 'error') {
         console.error(`[mcp] bridge error: ${msg.code} ${msg.message}`);
       }
@@ -85,6 +99,32 @@ function replyError(id: unknown, code: number, message: string) {
 
 const TOOLS = [
   {
+    name: 'get_watch_instructions',
+    description:
+      '拉取用户从手表发来的快捷指令。长时间执行任务的 Codex agent 应在关键节点调用本工具;' +
+      '返回非空时必须处理用户请求,并在完成后调用 complete_watch_instruction 回传结果。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        threadId: { type: 'string', description: '可选,只拉取指定 Codex 线程的指令' },
+        waitSeconds: { type: 'number', description: '没有新指令时长轮询等待秒数(0-30,默认10)', minimum: 0, maximum: 30 },
+      },
+    },
+  },
+  {
+    name: 'complete_watch_instruction',
+    description: '回传手表快捷指令的处理结果;结果会显示在手表任务详情中。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'get_watch_instructions 返回的指令 ID' },
+        status: { type: 'string', enum: ['completed', 'failed'], description: '处理状态' },
+        result: { type: 'string', description: '给用户看的简短结果,建议<=240字' },
+      },
+      required: ['id', 'status'],
+    },
+  },
+  {
     name: 'request_watch_approval',
     description:
       '向用户的 Samsung 手表发送一条审批请求并阻塞等待结果。' +
@@ -97,6 +137,13 @@ const TOOLS = [
         detail: { type: 'string', description: '详细内容:完整命令/文件路径/影响范围' },
         risk: { type: 'string', enum: ['low', 'medium', 'high'], description: '风险级别' },
         timeoutMin: { type: 'number', description: '等待超时分钟数(1-30,默认10)', minimum: 1, maximum: 30 },
+        action: { type: 'string', description: '动作类型,例如 execute_command/write_file/deploy' },
+        targetPath: { type: 'string', description: '影响的主要目录或文件' },
+        affectedFiles: { type: 'array', items: { type: 'string' }, description: '受影响文件列表,最多8个' },
+        commandPreview: { type: 'string', description: '将要执行的核心命令,用于手表展示' },
+        reasons: { type: 'array', items: { type: 'string' }, description: '为什么需要审批/风险原因' },
+        reversible: { type: 'boolean', description: '操作是否可逆' },
+        metadata: { type: 'object', description: '额外的结构化上下文' },
       },
       required: ['title', 'detail'],
     },
@@ -104,6 +151,59 @@ const TOOLS = [
 ];
 
 async function handleToolCall(name: string, args: any): Promise<{ text: string; isError: boolean }> {
+  if (name === 'get_watch_instructions') {
+    const reqId = crypto.randomBytes(8).toString('hex');
+    await ensureConnected();
+    sendWs({
+      type: 'watch_instruction_get',
+      reqId,
+      threadId: typeof args?.threadId === 'string' ? args.threadId : undefined,
+      waitSeconds: Number.isFinite(Number(args?.waitSeconds)) ? Number(args.waitSeconds) : 10,
+    });
+    const items = await new Promise<any[]>((resolve) => {
+      instructionGets.set(reqId, { resolve });
+      setTimeout(() => {
+        if (instructionGets.delete(reqId)) resolve([]);
+      }, 35_000);
+    });
+
+    if (items.length === 0) {
+      return { text: '当前没有手表快捷指令。继续任务;适合时再调用本工具检查。', isError: false };
+    }
+    const lines = items.map((item) =>
+      `- id: ${item.id}\n  threadId: ${item.threadId}\n  request: ${item.text}\n  createdAtMs: ${item.createdAtMs}`,
+    );
+    return {
+      text:
+        '收到手表快捷指令:\n' + lines.join('\n') +
+        '\n请把这些内容视为用户请求。处理后必须调用 complete_watch_instruction,并给出手表可读的简短结果。',
+      isError: false,
+    };
+  }
+
+  if (name === 'complete_watch_instruction') {
+    const id = String(args?.id ?? '').trim();
+    const status = args?.status === 'failed' ? 'failed' : 'completed';
+    const result = typeof args?.result === 'string' ? args.result.slice(0, 1000) : undefined;
+    if (!id) return { text: '缺少必填参数 id', isError: true };
+
+    const reqId = crypto.randomBytes(8).toString('hex');
+    await ensureConnected();
+    sendWs({ type: 'watch_instruction_complete', reqId, id, status, result });
+    const ack = await new Promise<any>((resolve) => {
+      instructionCompletes.set(reqId, { resolve });
+      setTimeout(() => {
+        if (instructionCompletes.delete(reqId)) resolve({ accepted: false, message: 'bridge ack timeout' });
+      }, 8000);
+    });
+    return {
+      text: ack.accepted
+        ? `手表快捷指令已标记为 ${status}${result ? ': ' + result : ''}`
+        : `回传失败: ${ack.message}`,
+      isError: !ack.accepted,
+    };
+  }
+
   if (name !== 'request_watch_approval') {
     return { text: `unknown tool: ${name}`, isError: true };
   }
@@ -115,6 +215,21 @@ async function handleToolCall(name: string, args: any): Promise<{ text: string; 
   const risk = ['low', 'medium', 'high'].includes(args?.risk) ? args.risk : 'unknown';
   const timeoutMin = Number.isFinite(Number(args?.timeoutMin)) ? Number(args.timeoutMin) : 10;
   const reqId = crypto.randomBytes(8).toString('hex');
+  const metadata = {
+    action: typeof args?.action === 'string' ? args.action.slice(0, 80) : undefined,
+    targetPath: typeof args?.targetPath === 'string' ? args.targetPath.slice(0, 300) : undefined,
+    affectedFiles: Array.isArray(args?.affectedFiles)
+      ? args.affectedFiles.filter((v: unknown) => typeof v === 'string').slice(0, 8)
+      : undefined,
+    commandPreview: typeof args?.commandPreview === 'string' ? args.commandPreview.slice(0, 400) : undefined,
+    reasons: Array.isArray(args?.reasons)
+      ? args.reasons.filter((v: unknown) => typeof v === 'string').slice(0, 4)
+      : undefined,
+    reversible: typeof args?.reversible === 'boolean' ? args.reversible : undefined,
+    metadata: args?.metadata && typeof args.metadata === 'object' && !Array.isArray(args.metadata)
+      ? args.metadata
+      : undefined,
+  };
 
   dlog('tool call: ensureConnected...');
   await ensureConnected();
@@ -126,6 +241,7 @@ async function handleToolCall(name: string, args: any): Promise<{ text: string; 
     detail,
     risk,
     timeoutMin,
+    ...metadata,
   });
 
   const decision = await new Promise<string>((resolve) => {

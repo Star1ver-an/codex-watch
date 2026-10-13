@@ -6,14 +6,19 @@ import type {
   HelloMsg,
   ApprovalResultMsg,
   ApprovalRequestCreateMsg,
+  TaskControlMsg,
+  ThreadMessageMsg,
+  WatchInstructionCompleteMsg,
+  WatchInstructionGetMsg,
   WatchToServerMsg,
   ThreadState,
 } from '../types.js';
 import { StateStore } from '../core/state-store.js';
+import { queueCodexMessage } from '../core/codex-dispatch.js';
 
 const AUTH_TIMEOUT_MS = 5_000;
 const HEARTBEAT_MS = 30_000;
-const DEBOUNCE_MS = 200;
+const DEBOUNCE_MS = 1_000;
 
 interface ClientConn {
   ws: WebSocket;
@@ -33,6 +38,7 @@ export class WsServer {
   private store: StateStore;
   private onThreadHandler: (threadId: string) => void;
   private onApprovalHandler: (threadId: string, approval: unknown) => void;
+  private onInstructionHandler: (instruction: unknown) => void;
 
   constructor(store: StateStore, token: string, pin: string, fingerprint: string) {
     this.store = store;
@@ -47,6 +53,8 @@ export class WsServer {
         threadTitle: this.threadTitle(threadId),
         approval: approval as any,
       });
+    this.onInstructionHandler = (instruction) =>
+      this.sendToRole('watch', { type: 'watch_instruction_update', instruction } as any);
   }
 
   start(opts: { port?: number; server?: import('node:http').Server; label?: string }): Promise<void> {
@@ -59,6 +67,7 @@ export class WsServer {
 
       this.store.on('thread', this.onThreadHandler);
       this.store.on('approval', this.onApprovalHandler);
+      this.store.on('instruction_update', this.onInstructionHandler);
 
       this.heartbeat = setInterval(() => {
         for (const c of this.clients) {
@@ -146,6 +155,22 @@ export class WsServer {
       }
       if (msg.type === 'approval_request_create') {
         this.handleApprovalCreate(conn, msg as unknown as ApprovalRequestCreateMsg);
+        return;
+      }
+      if (msg.type === 'task_control') {
+        this.handleTaskControl(conn, msg as TaskControlMsg);
+        return;
+      }
+      if (msg.type === 'thread_message') {
+        this.handleThreadMessage(conn, msg as ThreadMessageMsg);
+        return;
+      }
+      if (msg.type === 'watch_instruction_get') {
+        this.handleWatchInstructionGet(conn, msg as WatchInstructionGetMsg);
+        return;
+      }
+      if (msg.type === 'watch_instruction_complete') {
+        this.handleWatchInstructionComplete(conn, msg as WatchInstructionCompleteMsg);
       }
     });
     ws.on('close', () => {
@@ -155,6 +180,107 @@ export class WsServer {
       console.log(`[ws-server] client disconnected (total=${this.clients.size})`);
     });
     ws.on('error', () => { /* handled by close */ });
+  }
+
+  private handleTaskControl(conn: ClientConn, msg: TaskControlMsg) {
+    const threadId = String(msg.threadId ?? '');
+    const result = this.store.handleTaskControl(
+      threadId,
+      msg.action,
+      typeof msg.reason === 'string' ? msg.reason.slice(0, 160) : undefined,
+      `watch:${conn.role}`,
+    );
+    send(conn, {
+      type: 'control_result',
+      threadId,
+      action: msg.action,
+      accepted: result.accepted,
+      supported: result.supported,
+      message: result.message,
+      tsMs: Date.now(),
+    });
+    console.log(`[ws-server] task control ${msg.action}: ${result.message}`);
+  }
+
+  private async handleThreadMessage(conn: ClientConn, msg: ThreadMessageMsg) {
+    const threadId = String(msg.threadId ?? '');
+    const source = msg.source === 'watch_voice' ? 'watch_voice' : 'watch_quick_reply';
+    const result = this.store.recordThreadMessage(
+      threadId,
+      String(msg.text ?? ''),
+      source,
+      typeof msg.requestId === 'string' ? msg.requestId : undefined,
+    );
+
+    let accepted = result.accepted;
+    let message = result.message;
+    if (result.accepted && result.id) {
+      const dispatch = await queueCodexMessage(
+        threadId,
+        buildQueuePrompt(result.id, String(msg.text ?? '')),
+      );
+      if (dispatch.ok) {
+        this.store.markWatchInstructionDispatched(result.id);
+        message = '已投递到 Codex 会话，等待回应';
+      } else {
+        message = `已进入本地收件箱；Codex 会话投递失败：${dispatch.output || 'unknown error'}`;
+      }
+      console.log(`[ws-server] codex queue ${result.id}: ${dispatch.ok ? 'ok' : dispatch.output}`);
+    }
+
+    send(conn, {
+      type: 'control_result',
+      threadId,
+      action: 'send_message',
+      accepted,
+      supported: true,
+      message,
+      tsMs: Date.now(),
+      requestId: result.id,
+    });
+    console.log(`[ws-server] watch message ${result.id}: ${message}`);
+  }
+
+  private async handleWatchInstructionGet(conn: ClientConn, msg: WatchInstructionGetMsg) {
+    if (conn.role !== 'mcp') {
+      send(conn, { type: 'error', code: 'forbidden', message: 'watch_instruction_get requires mcp device' });
+      return;
+    }
+    const threadId = typeof msg.threadId === 'string' ? msg.threadId : undefined;
+    const waitSeconds = Number.isFinite(msg.waitSeconds) ? Number(msg.waitSeconds) : 10;
+    const instructions = await this.store.waitForWatchInstructions(
+      String(msg.reqId ?? ''),
+      threadId,
+      waitSeconds,
+    );
+    this.store.markWatchInstructionsDelivered(
+      instructions.map((item) => item.id),
+      'codex-poll',
+    );
+    send(conn, {
+      type: 'watch_instruction_get_result',
+      reqId: msg.reqId,
+      instructions,
+    });
+  }
+
+  private handleWatchInstructionComplete(conn: ClientConn, msg: WatchInstructionCompleteMsg) {
+    if (conn.role !== 'mcp') {
+      send(conn, { type: 'error', code: 'forbidden', message: 'watch_instruction_complete requires mcp device' });
+      return;
+    }
+    const result = this.store.completeWatchInstruction(
+      String(msg.id ?? ''),
+      msg.status === 'failed' ? 'failed' : 'completed',
+      typeof msg.result === 'string' ? msg.result : undefined,
+    );
+    send(conn, {
+      type: 'watch_instruction_complete_result',
+      reqId: msg.reqId,
+      accepted: result.accepted,
+      instruction: result.instruction,
+      message: result.message,
+    });
   }
 
   private handleApprovalCreate(conn: ClientConn, msg: ApprovalRequestCreateMsg) {
@@ -167,6 +293,19 @@ export class WsServer {
       detail: String(msg.detail ?? ''),
       risk: msg.risk ?? 'unknown',
       timeoutMin: msg.timeoutMin,
+      action: typeof msg.action === 'string' ? msg.action : undefined,
+      targetPath: typeof msg.targetPath === 'string' ? msg.targetPath : undefined,
+      affectedFiles: Array.isArray(msg.affectedFiles)
+        ? msg.affectedFiles.filter((v): v is string => typeof v === 'string')
+        : undefined,
+      commandPreview: typeof msg.commandPreview === 'string' ? msg.commandPreview : undefined,
+      reasons: Array.isArray(msg.reasons)
+        ? msg.reasons.filter((v): v is string => typeof v === 'string')
+        : undefined,
+      reversible: typeof msg.reversible === 'boolean' ? msg.reversible : undefined,
+      metadata: msg.metadata && typeof msg.metadata === 'object' && !Array.isArray(msg.metadata)
+        ? msg.metadata as Record<string, unknown>
+        : undefined,
     });
     send(conn, { type: 'approval_request_created', reqId: msg.reqId, approvalId: approval.id, threadId });
     console.log(`[ws-server] MCP approval created: ${approval.id} (${msg.title})`);
@@ -231,6 +370,19 @@ export class WsServer {
 function compactThread(thread: ThreadState): ThreadState {
   const { preview: _preview, ...compact } = thread;
   return compact;
+}
+
+function buildQueuePrompt(id: string, request: string): string {
+  const clean = request.trim();
+  const mapped = clean === '输出当前进展摘要'
+    ? '请基于当前对话的最新进展，直接回复一条简短摘要（不超过 200 字）。不要开始新的修改。'
+    : clean === '只分析问题，不要修改代码'
+      ? '请分析当前问题并给出结论。不要修改任何文件。'
+      : clean === '先停下来，等我回来'
+        ? '请暂停推进当前任务，保存当前上下文，等待用户回来后再继续。'
+        : clean;
+
+  return `[Codex Watch #${id}] ${mapped}\n这是用户从手表发来的快捷指令，请直接在当前对话中回应。`;
 }
 
 function send(conn: ClientConn, msg: ServerToWatchMsg) {

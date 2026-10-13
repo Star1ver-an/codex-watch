@@ -132,7 +132,8 @@ class BridgeClient(
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 val obj = try { JSONObject(text) } catch (e: Exception) { null } ?: return
-                main.post { onMessage(obj) }
+                // handleMessage parses heavy payloads on a worker and posts UI mutations back to main.
+                onMessage(obj)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {

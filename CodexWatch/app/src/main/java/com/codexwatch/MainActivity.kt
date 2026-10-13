@@ -16,7 +16,9 @@ import androidx.compose.runtime.getValue
 import androidx.wear.compose.navigation.SwipeDismissableNavHost
 import androidx.wear.compose.navigation.composable
 import androidx.wear.compose.navigation.rememberSwipeDismissableNavController
+import com.codexwatch.ui.ApprovalHistoryScreen
 import com.codexwatch.ui.PairingScreen
+import com.codexwatch.ui.QuickResultScreen
 import com.codexwatch.ui.TaskDetailScreen
 import com.codexwatch.ui.TaskListScreen
 import com.codexwatch.ui.theme.CodexWatchTheme
@@ -98,11 +100,23 @@ fun AppNavHost(vm: com.codexwatch.ui.AppViewModel) {
                 vm = vm,
                 onOpen = { id -> nav.navigate("detail/$id") },
                 onPair = { nav.navigate("pairing") },
+                onHistory = { nav.navigate("history") },
             )
+        }
+        composable("history") {
+            ApprovalHistoryScreen(vm)
+        }
+        composable("quick-result") {
+            QuickResultScreen(vm)
         }
         composable("detail/{id}") { backStackEntry ->
             val id = backStackEntry.arguments?.getString("id") ?: ""
-            TaskDetailScreen(ui = ui, vm = vm, threadId = id)
+            TaskDetailScreen(
+                ui = ui,
+                vm = vm,
+                threadId = id,
+                onOpenResult = { nav.navigate("quick-result") },
+            )
         }
     }
 }

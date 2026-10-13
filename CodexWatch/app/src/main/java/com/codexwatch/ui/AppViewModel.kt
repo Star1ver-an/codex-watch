@@ -10,11 +10,16 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.Stable
 import com.codexwatch.data.ApprovalEntry
+import com.codexwatch.data.ApprovalHistoryEntry
+import com.codexwatch.data.ApprovalHistoryStore
 import com.codexwatch.data.BridgeClient
+import com.codexwatch.data.ControlFeedback
+import com.codexwatch.data.InstructionFeedback
 import com.codexwatch.data.ConnState
 import com.codexwatch.data.PairingClient
 import com.codexwatch.data.PairingStore
 import com.codexwatch.data.ThreadState
+import com.codexwatch.data.parseApproval
 import com.codexwatch.data.parseThread
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -33,11 +38,14 @@ data class UiState(
     val host: String = "",
     val token: String = "",
     val pin: String = "",
+    val lastControl: ControlFeedback? = null,
+    val lastInstruction: InstructionFeedback? = null,
 )
 
 @Stable
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val store = PairingStore(app)
+    private val approvalHistoryStore = ApprovalHistoryStore(app)
     private val main = Handler(Looper.getMainLooper())
     private val parser: ExecutorService = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "watch-message-parser").apply { isDaemon = true }
@@ -66,12 +74,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _searching = androidx.compose.runtime.mutableStateOf(false)
     val searching: androidx.compose.runtime.State<Boolean> = _searching
 
+    private val _approvalHistory = androidx.compose.runtime.mutableStateOf<List<ApprovalHistoryEntry>>(emptyList())
+    val approvalHistory: androidx.compose.runtime.State<List<ApprovalHistoryEntry>> = _approvalHistory
+
     private var nsdManager: NsdManager? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private val notifiedApprovals = mutableSetOf<String>()
 
     init {
         // Auto-connect on launch if credentials were saved previously.
+        _approvalHistory.value = approvalHistoryStore.recent()
         if (store.host.isNotBlank() && store.token.isNotBlank()) connect()
     }
 
@@ -96,12 +108,75 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         merge { it.copy(conn = ConnState.DISCONNECTED) }
     }
 
-    fun decide(approvalId: String, approve: Boolean) {
+    fun decide(approvalId: String, approve: Boolean, note: String? = null) {
+        val state = _ui.value
+        val pair = state.threads.asSequence()
+            .flatMap { thread -> thread.pendingApprovals.asSequence().map { thread to it } }
+            .firstOrNull { it.second.id == approvalId } ?: return
+
         val obj = JSONObject()
             .put("type", "approval_result")
             .put("approvalId", approvalId)
             .put("decision", if (approve) "approve" else "reject")
-        client.send(obj.toString())
+        if (!note.isNullOrBlank()) obj.put("note", note.take(120))
+
+        if (!client.send(obj.toString())) return
+
+        approvalHistoryStore.record(
+            approval = pair.second,
+            threadId = pair.first.id,
+            threadTitle = pair.first.title,
+            decision = if (approve) "approve" else "reject",
+        )
+        _approvalHistory.value = approvalHistoryStore.recent()
+        refreshComplication()
+    }
+
+    fun sendTaskControl(threadId: String, action: String, reason: String? = null) {
+        val obj = JSONObject()
+            .put("type", "task_control")
+            .put("threadId", threadId)
+            .put("action", action)
+        if (!reason.isNullOrBlank()) obj.put("reason", reason.take(160))
+        if (!client.send(obj.toString())) {
+            merge {
+                it.copy(
+                    lastControl = ControlFeedback(
+                        threadId = threadId,
+                        action = action,
+                        accepted = false,
+                        supported = false,
+                        message = "桥接未连接，操作未发送",
+                        atMs = System.currentTimeMillis(),
+                    )
+                )
+            }
+        }
+    }
+
+    fun sendThreadMessage(threadId: String, text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        val obj = JSONObject()
+            .put("type", "thread_message")
+            .put("threadId", threadId)
+            .put("text", clean.take(240))
+            .put("source", "watch_quick_reply")
+            .put("requestId", java.util.UUID.randomUUID().toString())
+        if (!client.send(obj.toString())) {
+            merge {
+                it.copy(
+                    lastControl = ControlFeedback(
+                        threadId = threadId,
+                        action = "send_message",
+                        accepted = false,
+                        supported = true,
+                        message = "桥接未连接，快捷指令未发送",
+                        atMs = System.currentTimeMillis(),
+                    )
+                )
+            }
+        }
     }
 
     // ---- UDP broadcast discovery (primary, reliable on home LAN) ----
@@ -241,18 +316,38 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             }
             "approval_request" -> {
                 val aObj = msg.optJSONObject("approval") ?: return
-                val entry = ApprovalEntry(
-                    id = aObj.optString("id"),
-                    title = aObj.optString("title"),
-                    detail = aObj.optString("detail"),
-                    risk = aObj.optString("risk", "unknown"),
-                    createdAtMs = aObj.optLong("createdAtMs"),
-                )
+                val entry = parseApproval(aObj)
                 if (entry.id !in notifiedApprovals) {
                     notifiedApprovals.add(entry.id)
                     val threadTitle = msg.optString("threadTitle")
                     com.codexwatch.data.ApprovalNotifier.show(getApplication(), threadTitle, entry)
                 }
+            }
+            "watch_instruction_update" -> {
+                val obj = msg.optJSONObject("instruction") ?: return
+                val feedback = InstructionFeedback(
+                    id = obj.optString("id"),
+                    threadId = obj.optString("threadId"),
+                    status = obj.optString("status", "queued"),
+                    text = obj.optString("text"),
+                    result = obj.optString("result").ifBlank { null },
+                    atMs = obj.optLong(
+                        "completedAtMs",
+                        obj.optLong("deliveredAtMs", obj.optLong("createdAtMs", System.currentTimeMillis())),
+                    ),
+                )
+                main.post { merge { it.copy(lastInstruction = feedback) } }
+            }
+            "control_result" -> {
+                val feedback = ControlFeedback(
+                    threadId = msg.optString("threadId"),
+                    action = msg.optString("action"),
+                    accepted = msg.optBoolean("accepted", false),
+                    supported = msg.optBoolean("supported", false),
+                    message = msg.optString("message", "已处理"),
+                    atMs = msg.optLong("tsMs", System.currentTimeMillis()),
+                )
+                main.post { merge { it.copy(lastControl = feedback) } }
             }
             else -> Unit
         }
@@ -275,7 +370,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         pendingThreadUpdates[thread.id] = thread
         if (!threadFlushScheduled) {
             threadFlushScheduled = true
-            main.postDelayed(flushThreadUpdatesRunnable, 120L)
+            main.postDelayed(flushThreadUpdatesRunnable, 500L)
         }
     }
 

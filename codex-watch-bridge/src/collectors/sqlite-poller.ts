@@ -43,6 +43,7 @@ export class SqlitePoller {
                   updated_at_ms, recency_at_ms
            FROM threads
            WHERE archived = 0
+             AND COALESCE(thread_source, 'user') <> 'subagent'
            ORDER BY recency_at_ms DESC
            LIMIT ${QUERY_LIMIT}`
         )
