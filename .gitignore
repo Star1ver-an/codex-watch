@@ -1,0 +1,20 @@
+# Node / bridge generated files
+**/node_modules/
+**/dist/
+**/bridge.config.json
+**/bridge-live.log
+**/bridge-live.err
+**/mcp-debug.log
+**/certs/
+
+# Android / Gradle generated files
+**/.gradle/
+**/build/
+**/local.properties
+
+# IDE / OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
